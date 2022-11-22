@@ -13,11 +13,29 @@
 #include "soc/rtc_cntl_reg.h" // Disable brownour problems
 #include "driver/rtc_io.h"
 #include <EEPROM.h>
+#include <UniversalTelegramBot.h>
+#include <ArduinoJson.h>
+
 
 const char *ssid = "Capeo";
 const char *password = "capoo56789";
 
-int pictureNumber = 0;
+// Initialize Telegram BOT
+String BOTtoken = "5958029846:AAFIXLtw0OBjGvA-gVB_M3AWuvoicocbKnI";
+String CHAT_ID = "2076433378";
+//int pictureNumber = 0;
+
+bool sendPhoto = false;
+
+#define FLASH_LED_PIN 4
+bool flashState = LOW;
+
+//Checks for new messages every 1 second.
+int botRequestDelay = 1000;
+unsigned long lastTimeBotRan;
+
+WiFiClientSecure clientTCP;
+UniversalTelegramBot bot(BOTtoken, clientTCP);
 
 #define EEPROM_SIZE 10
 
@@ -25,11 +43,11 @@ int pictureNumber = 0;
 #define FACE_ID_SAVE_NUMBER 7
 
 // Select camera model
-#define CAMERA_MODEL_WROVER_KIT
+//#define CAMERA_MODEL_WROVER_KIT
 //#define CAMERA_MODEL_ESP_EYE
 //#define CAMERA_MODEL_M5STACK_PSRAM
 //#define CAMERA_MODEL_M5STACK_WIDE
-//#define CAMERA_MODEL_AI_THINKER
+#define CAMERA_MODEL_AI_THINKER
 #include "camera_pins.h"
 
 using namespace websockets;
@@ -41,8 +59,7 @@ long current_millis;
 long last_detected_millis = 0;
 
 #define relay_pin 2 // pin 12 can also be used
-#define RED 12 
-#define GREEN 13
+#define RED 13 
 unsigned long door_opened_millis = 0;
 long interval = 5000; // open lock for ... milliseconds
 bool face_recognised = false;
@@ -101,16 +118,136 @@ typedef struct
 
 httpd_resp_value st_name;
 
+void handleNewMessages(int numNewMessages) {
+  Serial.print("Handle New Messages: ");
+  Serial.println(numNewMessages);
+
+  for (int i = 0; i < numNewMessages; i++) {
+    String chat_id = String(bot.messages[i].chat_id);
+    if (chat_id != CHAT_ID){
+      bot.sendMessage(chat_id, "Unauthorized user", "");
+      continue;
+    }
+    
+    // Print the received message
+    String text = bot.messages[i].text;
+    Serial.println(text);
+    
+    String from_name = bot.messages[i].from_name;
+    if (text == "/start") {
+      String welcome = "Welcome , " + from_name + "\n";
+      welcome += "Use the following commands to interact with the ESP32-CAM \n";
+      welcome += "/photo : takes a new photo\n";
+      welcome += "/flash : toggles flash LED \n";
+      bot.sendMessage(CHAT_ID, welcome, "");
+    }
+    if (text == "/flash") {
+      flashState = !flashState;
+      digitalWrite(FLASH_LED_PIN, flashState);
+      Serial.println("Change flash LED state");
+    }
+    if (text == "/photo") {
+      sendPhoto = true;
+      Serial.println("New photo request");
+    }
+  }
+}
+
+String sendPhotoTelegram() {
+  const char* myDomain = "api.telegram.org";
+  String getAll = "";
+  String getBody = "";
+
+  camera_fb_t * fb = NULL;
+  fb = esp_camera_fb_get();  
+  if(!fb) {
+    Serial.println("Camera capture failed");
+    delay(1000);
+    ESP.restart();
+    return "Camera capture failed";
+  }  
+  
+  Serial.println("Connect to " + String(myDomain));
+
+
+  if (clientTCP.connect(myDomain, 443)) {
+    Serial.println("Connection successful");
+    
+    String head = "--RandomNerdTutorials\r\nContent-Disposition: form-data; name=\"chat_id\"; \r\n\r\n" + CHAT_ID + "\r\n--RandomNerdTutorials\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"esp32-cam.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n";
+    String tail = "\r\n--RandomNerdTutorials--\r\n";
+
+    uint16_t imageLen = fb->len;
+    uint16_t extraLen = head.length() + tail.length();
+    uint16_t totalLen = imageLen + extraLen;
+  
+    clientTCP.println("POST /bot"+BOTtoken+"/sendPhoto HTTP/1.1");
+    clientTCP.println("Host: " + String(myDomain));
+    clientTCP.println("Content-Length: " + String(totalLen));
+    clientTCP.println("Content-Type: multipart/form-data; boundary=RandomNerdTutorials");
+    clientTCP.println();
+    clientTCP.print(head);
+  
+    uint8_t *fbBuf = fb->buf;
+    size_t fbLen = fb->len;
+    for (size_t n=0;n<fbLen;n=n+1024) {
+      if (n+1024<fbLen) {
+        clientTCP.write(fbBuf, 1024);
+        fbBuf += 1024;
+      }
+      else if (fbLen%1024>0) {
+        size_t remainder = fbLen%1024;
+        clientTCP.write(fbBuf, remainder);
+      }
+    }  
+    
+    clientTCP.print(tail);
+    
+    esp_camera_fb_return(fb);
+    
+    int waitTime = 10000;   // timeout 10 seconds
+    long startTimer = millis();
+    boolean state = false;
+    
+    while ((startTimer + waitTime) > millis()){
+      Serial.print(".");
+      delay(100);      
+      while (clientTCP.available()) {
+        char c = clientTCP.read();
+        if (state==true) getBody += String(c);        
+        if (c == '\n') {
+          if (getAll.length()==0) state=true; 
+          getAll = "";
+        } 
+        else if (c != '\r')
+          getAll += String(c);
+        startTimer = millis();
+      }
+      if (getBody.length()>0) break;
+    }
+    clientTCP.stop();
+    Serial.println(getBody);
+  }
+  else {
+    getBody="Connected to api.telegram.org failed.";
+    Serial.println("Connected to api.telegram.org failed.");
+  }
+  return getBody;
+}
+
+
 void setup()
 {
+  
   Serial.begin(115200);
   Serial.setDebugOutput(true);
   Serial.println();
-  pinMode(GREEN, OUTPUT);
+  pinMode(FLASH_LED_PIN, OUTPUT);
+  digitalWrite(FLASH_LED_PIN, flashState);
+ 
   pinMode(RED, OUTPUT);
   pinMode(relay_pin, OUTPUT);
   digitalWrite(relay_pin, LOW);
-  digitalWrite(GREEN, LOW);
+ 
   digitalWrite(RED, HIGH);
   
 
@@ -170,6 +307,22 @@ void setup()
   s->set_hmirror(s, 1);
 #endif
 
+  WiFi.mode(WIFI_STA);
+  Serial.println();
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);
+  clientTCP.setCACert(TELEGRAM_CERTIFICATE_ROOT); // Add root certificate for api.telegram.org
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println();
+  Serial.print("ESP32-CAM IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); 
+/* //Connect to SD card + tang  chi  so cua EEPROM
   // Serial.println("Starting SD Card");
   if (!SD_MMC.begin())
   {
@@ -187,24 +340,15 @@ void setup()
  // initialize EEPROM with predefined size
     EEPROM.begin(EEPROM_SIZE);
     pictureNumber = EEPROM.read(0) + 1;
-
+*/
   // Start connect to wifi
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED)
-  {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("");
-  Serial.println("WiFi connected");
+
 
   app_httpserver_init();
   app_facenet_main();
   socket_server.listen(82);
 
-  Serial.print("Camera Ready! Use 'http://");
-  Serial.print(WiFi.localIP());
-  Serial.println("' to connect");
+  
 }
 
 static esp_err_t index_handler(httpd_req_t *req)
@@ -311,13 +455,13 @@ void open_door(WebsocketsClient &client)
   if (digitalRead(relay_pin) == LOW)
   {
     digitalWrite(relay_pin, HIGH); // relay go low so lock > unlock 
-    digitalWrite(GREEN, HIGH);
     digitalWrite(RED, LOW);
     Serial.println("Door Unlocked");
     client.send("door_open");
     door_opened_millis = millis(); // time relay closed and door opened
     camera_fb_t *fb = NULL;
 
+/* //Lỗi của SD card 
     // Take Picture with Camera
     fb = esp_camera_fb_get();
     if (!fb)
@@ -346,11 +490,27 @@ void open_door(WebsocketsClient &client)
       EEPROM.commit();
     }
     file.close();
+    */
   }
 }
 
 void loop()
 {
+if (sendPhoto) {
+    Serial.println("Preparing photo");
+    sendPhotoTelegram(); 
+    sendPhoto = false; 
+  }
+  if (/*millis() > lastTimeBotRan + botRequestDelay*/true)  {
+    int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+    while (numNewMessages) {
+      Serial.println("got response");
+      handleNewMessages(numNewMessages);
+      numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+    }
+    //lastTimeBotRan = millis();
+  }
+  //-----------------------------------------------------------
   auto client = socket_server.accept();
   client.onMessage(handle_message);
   dl_matrix3du_t *image_matrix = dl_matrix3du_alloc(1, 320, 240, 3);
@@ -367,7 +527,6 @@ void loop()
     if (millis() - interval > door_opened_millis)
     {                               // current time - face recognised time > 5 secs
       digitalWrite(relay_pin, LOW); // relay low > no  power then lock door
-      digitalWrite(GREEN, HIGH);
 
       digitalWrite(RED, HIGH);
 
